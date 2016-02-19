@@ -62,18 +62,18 @@
  * Some of the higher-level elements have 4-byte identifiers;
  * The lower-level elements have 1-byte identifiers.
  */
-#define UNCOMMON_MAGIC_LEN 4
+#define EBML_LONG_MASK (~0x10000000)
 
-#define SEGMENT_MAGIC "\x18\x53\x80\x67"
-#define CLUSTER_MAGIC "\x1F\x43\xB6\x75"
-#define TRACKS_MAGIC "\x16\x54\xAE\x6B"
+#define SEGMENT_ID (0x18538067 & EBML_LONG_MASK)
+#define CLUSTER_ID (0x1F43B675 & EBML_LONG_MASK)
+#define TRACKS_ID  (0x1654AE6B & EBML_LONG_MASK)
 
-#define COMMON_MAGIC_LEN 1
+#define EBML_SHORT_MASK (~0x80)
 
-#define TRACK_ENTRY_MAGIC "\xAE"
-#define TRACK_NUMBER_MAGIC "\xD7"
-#define TRACK_TYPE_MAGIC "\x83"
-#define SIMPLE_BLOCK_MAGIC "\xA3"
+#define TRACK_ENTRY_ID  (0xAE & EBML_SHORT_MASK)
+#define TRACK_NUMBER_ID (0xD7 & EBML_SHORT_MASK)
+#define TRACK_TYPE_ID   (0x83 & EBML_SHORT_MASK)
+#define SIMPLE_BLOCK_ID (0xA3 & EBML_SHORT_MASK)
 
 /* If support for Tags gets added, it may make sense
  * to convert this into a pair of flags signaling
@@ -646,107 +646,105 @@ static ssize_t ebml_wrote(ebml_t *ebml, size_t len)
                     payload_length = 0;
                 }
 
+                switch(tag_id) {
                     /* Recognize tags of interest */
-                    if (tag_length > UNCOMMON_MAGIC_LEN) {
-                        if (!memcmp(ebml->input_buffer + cursor, CLUSTER_MAGIC, UNCOMMON_MAGIC_LEN)) {
-                            /* Found a Cluster */
-                            ebml->parse_state = EBML_STATE_START_CLUSTER;
+                    case CLUSTER_ID:
+                        /* Found a Cluster */
+                        ebml->parse_state = EBML_STATE_START_CLUSTER;
+                        continue;
+
+                    case SEGMENT_ID:
+                    case TRACKS_ID:
+                        /* Parse all children */
+                        payload_length = 0;
+                        break;
+
+                    case SIMPLE_BLOCK_ID:
+                        /* Probe SimpleBlock header for the keyframe status */
+                        if (ebml->cluster_starts_with_keyframe != EBML_KEYFRAME_UNKNOWN) {
                             break;
-                        } else if (!memcmp(ebml->input_buffer + cursor, SEGMENT_MAGIC, UNCOMMON_MAGIC_LEN)) {
-                            /* Parse all Segment children */
-                            payload_length = 0;
-
-                        } else if (!memcmp(ebml->input_buffer + cursor, TRACKS_MAGIC, UNCOMMON_MAGIC_LEN)) {
-                            /* Parse all Tracks children */
-                            payload_length = 0;
-
                         }
+                        track_number_length = ebml_parse_var_int(ebml->input_buffer + cursor + tag_length,
+                                                          end_of_buffer, &track_number);
 
-                    }
+                        if (track_number_length == 0) {
+                            /* Wait for more data */
+                            processing = false;
+                            break;
+                        } else if (track_number_length < 0) {
+                            return -1;
+                        } else if (track_number == ebml->keyframe_track_number) {
+                            /* this block belongs to the video track */
 
-                    if (tag_length > COMMON_MAGIC_LEN) {
-                        if (!memcmp(ebml->input_buffer + cursor, SIMPLE_BLOCK_MAGIC, COMMON_MAGIC_LEN)) {
-                            /* Probe SimpleBlock header for the keyframe status */
-                            if (ebml->cluster_starts_with_keyframe == EBML_KEYFRAME_UNKNOWN) {
-                                track_number_length = ebml_parse_var_int(ebml->input_buffer + cursor + tag_length,
-                                                                  end_of_buffer, &track_number);
-
-                                if (track_number_length == 0) {
-                                    /* Wait for more data */
-                                    processing = false;
-                                } else if (track_number_length < 0) {
-                                    return -1;
-                                } else if (track_number == ebml->keyframe_track_number) {
-                                    /* this block belongs to the video track */
-
-                                    /* skip the 16-bit timecode for now, read the flags byte */
-                                    if (cursor + tag_length + track_number_length + 2 >= ebml->input_position) {
-                                        /* Wait for more data */
-                                        processing = false;
-                                    } else {
-                                        flags = ebml->input_buffer[cursor + tag_length + track_number_length + 2];
-
-                                        if (flags & 0x80) {
-                                            /* "keyframe" flag is set */
-                                            ebml->cluster_starts_with_keyframe = EBML_KEYFRAME_STARTS_CLUSTER;
-                                            /* ICECAST_LOG_DEBUG("Found keyframe in track %hhu", track_number); */
-                                        } else {
-                                            ebml->cluster_starts_with_keyframe = EBML_KEYFRAME_DOES_NOT_START_CLUSTER;
-                                            /* ICECAST_LOG_DEBUG("Found non-keyframe in track %hhu", track_number); */
-                                        }
-                                    }
-
-                                }
-
-                            }
-
-                        } else if (!memcmp(ebml->input_buffer + cursor, TRACK_ENTRY_MAGIC, COMMON_MAGIC_LEN)) {
-                            /* Parse all TrackEntry children; reset the state */
-                            payload_length = 0;
-                            ebml->parsing_track_number = EBML_UNKNOWN;
-                            ebml->parsing_track_is_video = false;
-
-                        } else if (!memcmp(ebml->input_buffer + cursor, TRACK_NUMBER_MAGIC, COMMON_MAGIC_LEN)) {
-                            /* Probe TrackNumber for value */
-                            value_length = ebml_parse_sized_int(ebml->input_buffer + cursor + tag_length,
-                                                                end_of_buffer, payload_length, 0, &data_value);
-
-                            if (value_length == 0) {
+                            /* skip the 16-bit timecode for now, read the flags byte */
+                            if (cursor + tag_length + track_number_length + 2 >= ebml->input_position) {
                                 /* Wait for more data */
                                 processing = false;
-                            } else if (value_length < 0) {
-                                return -1;
                             } else {
-                                ebml->parsing_track_number = data_value;
+                                flags = ebml->input_buffer[cursor + tag_length + track_number_length + 2];
+
+                                if (flags & 0x80) {
+                                    /* "keyframe" flag is set */
+                                    ebml->cluster_starts_with_keyframe = EBML_KEYFRAME_STARTS_CLUSTER;
+                                    /* ICECAST_LOG_DEBUG("Found keyframe in track %hhu", track_number); */
+                                } else {
+                                    ebml->cluster_starts_with_keyframe = EBML_KEYFRAME_DOES_NOT_START_CLUSTER;
+                                    /* ICECAST_LOG_DEBUG("Found non-keyframe in track %hhu", track_number); */
+                                }
+                            }
+
+                        }
+                        break;
+
+                    case TRACK_ENTRY_ID:
+                        /* Parse all TrackEntry children; reset the state */
+                        payload_length = 0;
+                        ebml->parsing_track_number = EBML_UNKNOWN;
+                        ebml->parsing_track_is_video = false;
+                        break;
+
+                    case TRACK_NUMBER_ID:
+                        /* Probe TrackNumber for value */
+                        value_length = ebml_parse_sized_int(ebml->input_buffer + cursor + tag_length,
+                                                            end_of_buffer, payload_length, 0, &data_value);
+
+                        if (value_length == 0) {
+                            /* Wait for more data */
+                            processing = false;
+                        } else if (value_length < 0) {
+                            return -1;
+                        } else {
+                            ebml->parsing_track_number = data_value;
+                            ebml_check_track(ebml);
+                        }
+                        break;
+
+                    case TRACK_TYPE_ID:
+                        /* Probe TrackType for a video flag */
+                        value_length = ebml_parse_sized_int(ebml->input_buffer + cursor + tag_length,
+                                                            end_of_buffer, payload_length, 0, &data_value);
+
+                        if (value_length == 0) {
+                            /* Wait for more data */
+                            processing = false;
+                        } else if (value_length < 0) {
+                            return -1;
+                        } else {
+                            if (data_value & 0x01) {
+                                /* This is a video track (0x01 flag = video) */
+                                ebml->parsing_track_is_video = true;
                                 ebml_check_track(ebml);
                             }
-
-                        } else if (!memcmp(ebml->input_buffer + cursor, TRACK_TYPE_MAGIC, COMMON_MAGIC_LEN)) {
-                            /* Probe TrackType for a video flag */
-                            value_length = ebml_parse_sized_int(ebml->input_buffer + cursor + tag_length,
-                                                                end_of_buffer, payload_length, 0, &data_value);
-
-                            if (value_length == 0) {
-                                /* Wait for more data */
-                                processing = false;
-                            } else if (value_length < 0) {
-                                return -1;
-                            } else {
-                                if (data_value & 0x01) {
-                                    /* This is a video track (0x01 flag = video) */
-                                    ebml->parsing_track_is_video = true;
-                                    ebml_check_track(ebml);
-                                }
-                            }
-
                         }
-                    }
+                        break;
 
-                    if (processing) {
-                        /* Moving to next element, copy current to buffer */
-                        ebml->copy_len = tag_length + payload_length;
-                        ebml->parse_state = copy_state;
-                    }
+                }
+
+                if (processing) {
+                    /* Moving to next element, copy current to buffer */
+                    ebml->copy_len = tag_length + payload_length;
+                    ebml->parse_state = copy_state;
+                }
 
                 break;
 
